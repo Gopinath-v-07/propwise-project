@@ -1,0 +1,16 @@
+{
+  "name": "Propwise Staff",
+  "short_name": "Propwise",
+  "start_url": "/staff/dashboard",
+  "display": "standalone",
+  "background_color": "#f7f7fb",
+  "theme_color": "#6956d8",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

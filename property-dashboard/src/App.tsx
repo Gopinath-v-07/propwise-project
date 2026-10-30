@@ -12,7 +12,7 @@ type Property = {
   status: 'On track' | 'Needs attention'
 }
 
-type RequestStatus = 'Open' | 'In progress' | 'Overdue' | 'Resolved'
+type RequestStatus = 'Open' | 'Arriving' | 'In progress' | 'Waiting for parts' | 'Overdue' | 'Resolved'
 type Priority = 'High' | 'Medium' | 'Low'
 type ServiceRequest = {
   id: string
@@ -23,6 +23,7 @@ type ServiceRequest = {
   status: RequestStatus
   vendor: string
   created: string
+  description?: string
 }
 type WidgetKey = 'metrics' | 'occupancy' | 'tasks' | 'requests' | 'properties'
 type Notification = { id: string; title: string; detail: string; time: string; read: boolean }
@@ -34,7 +35,11 @@ const initialProperties: Property[] = [
   { name: 'Willow Creek', location: 'San Antonio, TX', units: 52, occupied: 49, revenue: '₹67,900', status: 'On track' },
 ]
 
-const serviceRequests: ServiceRequest[] = [
+function getAvailableUnits(properties: Property[]) {
+  return properties.reduce((available, property) => available + Math.max(property.units - property.occupied, 0), 0)
+}
+
+const defaultServiceRequests: ServiceRequest[] = [
   { id: 'REQ-1042', title: 'Kitchen sink leak', property: 'The Franklin', category: 'Plumbing', priority: 'High', status: 'Overdue', vendor: 'Apex Plumbing', created: 'Today' },
   { id: 'REQ-1041', title: 'Replace hallway light', property: 'Lakeside Commons', category: 'Electrical', priority: 'Medium', status: 'In progress', vendor: 'BrightWorks', created: 'Yesterday' },
   { id: 'REQ-1040', title: 'AC not cooling', property: 'Parkview Residences', category: 'HVAC', priority: 'High', status: 'Open', vendor: 'Unassigned', created: 'Sep 5' },
@@ -42,6 +47,195 @@ const serviceRequests: ServiceRequest[] = [
   { id: 'REQ-1038', title: 'Water stain on ceiling', property: 'The Franklin', category: 'Plumbing', priority: 'High', status: 'Open', vendor: 'Unassigned', created: 'Sep 3' },
   { id: 'REQ-1037', title: 'Lobby paint touch-up', property: 'Lakeside Commons', category: 'General', priority: 'Low', status: 'Resolved', vendor: 'In-house', created: 'Sep 2' },
 ]
+
+const API_BASE = 'http://localhost:5000/api'
+const OFFLINE_ACTIONS_KEY = 'propwise_offline_actions'
+
+type OfflineAction = {
+  id: string
+  url: string
+  body: string
+  createdAt: string
+}
+
+function readOfflineActions(): OfflineAction[] {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(OFFLINE_ACTIONS_KEY) || '[]')
+    return Array.isArray(parsed) ? parsed as OfflineAction[] : []
+  } catch {
+    return []
+  }
+}
+
+function queueOfflineAction(url: string, body: Record<string, string>) {
+  const action: OfflineAction = {
+    id: `${Date.now()}-${Math.random()}`,
+    url,
+    body: JSON.stringify(body),
+    createdAt: new Date().toISOString(),
+  }
+  window.localStorage.setItem(OFFLINE_ACTIONS_KEY, JSON.stringify([...readOfflineActions(), action]))
+}
+
+async function flushOfflineActions() {
+  if (!navigator.onLine) return
+  const actions = readOfflineActions()
+  const remaining: OfflineAction[] = []
+  for (const action of actions) {
+    try {
+      const response = await fetch(action.url, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: action.body,
+      })
+      if (!response.ok) remaining.push(action)
+    } catch {
+      remaining.push(action)
+    }
+  }
+  window.localStorage.setItem(OFFLINE_ACTIONS_KEY, JSON.stringify(remaining))
+  window.dispatchEvent(new Event('propwise_offline_queue_updated'))
+}
+
+export function useServiceRequests(role?: string, userId?: string) {
+  const [requests, setRequests] = useState<ServiceRequest[]>(() => {
+    const stored = window.localStorage.getItem('propwise_service_requests')
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored)
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    return defaultServiceRequests
+  })
+
+  const syncRequests = async () => {
+    try {
+      const url = new URL(`${API_BASE}/requests`)
+      if (role) url.searchParams.append('role', role.toLowerCase().replace('property_manager', 'manager'))
+      if (userId) url.searchParams.append('userId', String(userId))
+
+      const res = await fetch(url.toString())
+      if (res.ok) {
+        const dbRows = await res.json()
+        if (Array.isArray(dbRows)) {
+          const fetchedRequests: ServiceRequest[] = dbRows.map((r: any) => ({
+            id: `REQ-${r.id}`,
+            title: r.title,
+            property: r.property || 'The Franklin',
+            category: r.category || 'Plumbing',
+            priority: (r.priority as Priority) || 'Medium',
+            status: (r.status as RequestStatus) || 'Open',
+            vendor: r.staff_name || (r.assigned_staff_id ? `Staff #${r.assigned_staff_id}` : 'Unassigned'),
+            created: r.created_at ? new Date(r.created_at).toLocaleDateString([], { month: 'short', day: 'numeric' }) : 'Today',
+            description: r.description
+          }))
+
+          setRequests((prev) => {
+            const fetchedIds = new Set(fetchedRequests.map((f) => f.id))
+            const localOnly = prev.filter((p) => !fetchedIds.has(p.id))
+            const merged = [...fetchedRequests, ...localOnly]
+            window.localStorage.setItem('propwise_service_requests', JSON.stringify(merged))
+            return merged
+          })
+        }
+      }
+    } catch (err) {
+      console.warn('Backend API sync warning:', err)
+    }
+  }
+
+  useEffect(() => {
+    syncRequests()
+
+    const onUpdate = () => {
+      const stored = window.localStorage.getItem('propwise_service_requests')
+      if (stored) {
+        try {
+          setRequests(JSON.parse(stored))
+        } catch (e) {
+          /* ignore parse errors */
+        }
+      }
+      syncRequests()
+    }
+
+    window.addEventListener('propwise_requests_updated', onUpdate)
+    return () => window.removeEventListener('propwise_requests_updated', onUpdate)
+  }, [role, userId])
+
+  const addRequest = async (req: { title: string; property?: string; category?: string; priority?: Priority; description?: string; tenant_id?: string }) => {
+    const newId = `REQ-${Math.floor(1044 + Math.random() * 9000)}`
+    const newReqItem: ServiceRequest = {
+      id: newId,
+      title: req.title,
+      property: req.property || 'The Franklin',
+      category: req.category || 'Plumbing',
+      priority: req.priority || 'Medium',
+      status: 'Open',
+      vendor: 'Unassigned',
+      created: 'Just now',
+      description: req.description || req.title
+    }
+
+    setRequests((prev) => {
+      const updated = [newReqItem, ...prev]
+      window.localStorage.setItem('propwise_service_requests', JSON.stringify(updated))
+      return updated
+    })
+    window.dispatchEvent(new Event('propwise_requests_updated'))
+
+    try {
+      await fetch(`${API_BASE}/requests`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tenant_id: req.tenant_id ? parseInt(req.tenant_id, 10) || null : null,
+          title: req.title,
+          description: req.description || req.title,
+          property: req.property || 'The Franklin',
+          category: req.category || 'Plumbing',
+          priority: req.priority || 'Medium'
+        })
+      })
+      syncRequests()
+    } catch (e) {
+      console.warn('Backend POST request failed, saved locally:', e)
+    }
+  }
+
+  const updateRequestStatus = async (id: string, status: RequestStatus, vendor?: string) => {
+    setRequests((prev) => {
+      const updated = prev.map((r) => (r.id === id ? { ...r, status, vendor: vendor || r.vendor } : r))
+      window.localStorage.setItem('propwise_service_requests', JSON.stringify(updated))
+      return updated
+    })
+    window.dispatchEvent(new Event('propwise_requests_updated'))
+
+    const rawId = id.replace('REQ-', '')
+    if (!isNaN(Number(rawId))) {
+      const progressStatus = ['Arriving', 'In progress', 'Waiting for parts', 'Resolved'].includes(status)
+      try {
+        await fetch(`${API_BASE}/requests/${rawId}/${progressStatus ? 'progress' : 'status'}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status })
+        }).then(response => {
+          if (!response.ok) throw new Error('Progress update failed')
+        })
+      } catch (e) {
+        if (progressStatus) {
+          queueOfflineAction(`${API_BASE}/requests/${rawId}/progress`, { status })
+          window.dispatchEvent(new Event('propwise_offline_queue_updated'))
+        }
+      }
+    }
+  }
+
+  return { requests, addRequest, updateRequestStatus, syncRequests }
+}
 
 const navItems = [
   ['Overview', '▦', '/manager/dashboard'],
@@ -57,6 +251,7 @@ function DashboardPage() {
   const { user, logout } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
+  const { requests: serviceRequests, updateRequestStatus, syncRequests } = useServiceRequests('manager', user?.id)
   const [query, setQuery] = useState('')
   const [requestQuery, setRequestQuery] = useState('')
   const [requestStatus, setRequestStatus] = useState<'All' | RequestStatus>('All')
@@ -133,15 +328,21 @@ function DashboardPage() {
   const filteredRequests = useMemo(() => serviceRequests.filter((request) => {
     const matchesQuery = `${request.title} ${request.property} ${request.id}`.toLowerCase().includes(requestQuery.toLowerCase())
     return matchesQuery && (requestStatus === 'All' || request.status === requestStatus) && (requestPriority === 'All' || request.priority === requestPriority)
-  }), [requestQuery, requestStatus, requestPriority])
+  }), [serviceRequests, requestQuery, requestStatus, requestPriority])
   const requestPageSize = 4
   const requestPages = Math.max(1, Math.ceil(filteredRequests.length / requestPageSize))
   const visibleRequests = filteredRequests.slice((requestPage - 1) * requestPageSize, requestPage * requestPageSize)
   const openRequests = serviceRequests.filter((request) => request.status !== 'Resolved').length
   const overdueRequests = serviceRequests.filter((request) => request.status === 'Overdue').length
+  const availableHomes = getAvailableUnits(properties)
+  const completedRequests = serviceRequests.filter((request) => request.status === 'Resolved').length
+  const completionRate = serviceRequests.length > 0 ? Math.round((completedRequests / serviceRequests.length) * 100) : 0
+  const pendingApprovals = serviceRequests.filter((request) => request.status === 'Resolved').length
+  const assignedWorkload = serviceRequests.filter((request) => request.vendor !== 'Unassigned').length
   const unreadNotifications = notifications.filter((notification) => !notification.read).length
   const refreshDashboard = () => {
     setRefreshing(true)
+    syncRequests()
     window.setTimeout(() => {
       setLastUpdated(new Date())
       setRefreshing(false)
@@ -220,6 +421,10 @@ function DashboardPage() {
 
           {widgets.includes('metrics') && <section className="metric-grid" aria-label="Portfolio summary">
             <Metric label="Open requests" value={String(openRequests)} change={`${overdueRequests} overdue`} icon="⚒" warning />
+            <Metric label="Available homes" value={String(availableHomes)} change={`Across ${properties.length} properties`} icon="⌂" positive />
+            <Metric label="Assigned workload" value={String(assignedWorkload)} change="Requests with staff assigned" icon="♙" />
+            <Metric label="Pending approvals" value={String(pendingApprovals)} change="Completed work to review" icon="✓" warning={pendingApprovals > 0} />
+            <Metric label="Completion rate" value={`${completionRate}%`} change="Across all requests" icon="◉" positive />
             <Metric label="SLA compliance" value="91.6%" change="+3.2% vs last month" icon="◉" positive />
             <Metric label="Avg. response time" value="2h 18m" change="-24m vs last month" icon="◷" positive />
             <Metric label="Satisfaction" value="4.8/5" change="+0.3 vs last month" icon="★" positive />
@@ -271,8 +476,14 @@ function DashboardPage() {
       }} />}
       {showWidgetSettings && <WidgetSettings widgets={widgets} onClose={() => setShowWidgetSettings(false)} onToggle={(widget) => setWidgets((current) => current.includes(widget) ? current.filter((item) => item !== widget) : [...current, widget])} onMove={moveWidget} />}
       {showExport && <ExportModal onClose={() => setShowExport(false)} onExport={exportRequests} count={filteredRequests.length} />}
-      {selectedRequest && <RequestDetail request={selectedRequest} onClose={() => setSelectedRequest(null)} />}
-      {showSearch && <GlobalSearch onClose={() => setShowSearch(false)} properties={properties} />}
+      {selectedRequest && (
+        <RequestDetail
+          request={selectedRequest}
+          onClose={() => setSelectedRequest(null)}
+          onUpdateStatus={(id, status, vendor) => updateRequestStatus(id, status, vendor)}
+        />
+      )}
+      {showSearch && <GlobalSearch onClose={() => setShowSearch(false)} properties={properties} serviceRequests={serviceRequests} />}
       {showNotifications && <NotificationsPanel notifications={notifications} onClose={() => setShowNotifications(false)} onRead={(id) => setNotifications((items) => items.map((item) => item.id === id ? { ...item, read: true } : item))} onReadAll={() => setNotifications((items) => items.map((item) => ({ ...item, read: true })))} />}
       <QuickPageNavigator />
     </div>
@@ -289,11 +500,357 @@ function ExportModal({ onClose, onExport, count }: { onClose: () => void; onExpo
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal-card export-modal" role="dialog" aria-modal="true" aria-labelledby="export-title"><div className="modal-heading"><div><p className="eyebrow">DATA EXPORT</p><h2 id="export-title">Export requests</h2><p className="muted">{count} filtered requests are ready to download.</p></div><button className="modal-close" type="button" onClick={onClose} aria-label="Close">×</button></div><div className="export-options"><button type="button" onClick={() => onExport('csv')}><strong>CSV</strong><span>Spreadsheet-friendly format</span></button><button type="button" onClick={() => onExport('json')}><strong>JSON</strong><span>Structured data format</span></button></div></section></div>
 }
 
-function RequestDetail({ request, onClose }: { request: ServiceRequest; onClose: () => void }) {
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal-card request-detail" role="dialog" aria-modal="true" aria-labelledby="request-detail-title"><div className="modal-heading"><div><p className="eyebrow">{request.id} · {request.category.toUpperCase()}</p><h2 id="request-detail-title">{request.title}</h2><p className="muted">Opened {request.created} at {request.property}</p></div><button className="modal-close" type="button" onClick={onClose} aria-label="Close">×</button></div><div className="detail-grid"><div><small>Priority</small><strong className={`priority priority-${request.priority.toLowerCase()}`}>{request.priority}</strong></div><div><small>Status</small><strong>{request.status}</strong></div><div><small>Assigned to</small><strong>{request.vendor}</strong></div><div><small>Property</small><strong>{request.property}</strong></div></div><div className="request-timeline"><span className="timeline-dot active" /><div><strong>Request created</strong><small>{request.created}</small></div><span className="timeline-line" /><span className={`timeline-dot ${request.status !== 'Open' ? 'active' : ''}`} /><div><strong>Work {request.status === 'Resolved' ? 'completed' : 'in progress'}</strong><small>{request.status === 'Open' ? 'Awaiting assignment' : request.vendor}</small></div></div></section></div>
+type StaffMember = {
+  id: string | number
+  name: string
+  email: string
+  phone: string
+  specialty?: string
+  active_tasks_count: number
+  category?: string
 }
 
-function GlobalSearch({ onClose, properties }: { onClose: () => void; properties: Property[] }) {
+type StaffAssignment = {
+  requestId: string
+  staffId: string | number
+  name: string
+  email: string
+  phone: string
+  specialty?: string
+  category: string
+  assignedAt: string
+}
+
+const defaultStaffList: StaffMember[] = [
+  { id: 'usr_ravi_electrician', name: 'Ravi Kumar', email: 'ravi.electrician@propwise.test', phone: '+91 98765 43210', specialty: 'Electrician', category: 'Electrical Specialist', active_tasks_count: 0 },
+  { id: 'usr_anita_electrician', name: 'Anita Das', email: 'anita.electrician@propwise.test', phone: '+91 98765 43211', specialty: 'Electrician', category: 'Electrical Specialist', active_tasks_count: 0 },
+  { id: 'usr_vikram_plumber', name: 'Vikram Singh', email: 'vikram.plumber@propwise.test', phone: '+91 98765 43212', specialty: 'Plumber', category: 'Plumbing Specialist', active_tasks_count: 0 },
+  { id: 'usr_neha_plumber', name: 'Neha Patel', email: 'neha.plumber@propwise.test', phone: '+91 98765 43213', specialty: 'Plumber', category: 'Plumbing Specialist', active_tasks_count: 0 },
+  { id: 'usr_arjun_carpenter', name: 'Arjun Mehta', email: 'arjun.carpenter@propwise.test', phone: '+91 98765 43214', specialty: 'Carpenter', category: 'Carpentry Specialist', active_tasks_count: 0 },
+  { id: 'usr_kavya_carpenter', name: 'Kavya Rao', email: 'kavya.carpenter@propwise.test', phone: '+91 98765 43215', specialty: 'Carpenter', category: 'Carpentry Specialist', active_tasks_count: 0 },
+  { id: 'usr_staff', name: 'Sam Staff', email: 'staff@propwise.test', phone: '+91 98765 43216', specialty: 'General', category: 'General Operations', active_tasks_count: 0 },
+  { id: 'usr_chris', name: 'Chris Lee', email: 'chris@propwise.test', phone: '+91 98765 43217', specialty: 'General', category: 'General Maintenance', active_tasks_count: 0 },
+]
+
+function RequestDetail({ request, onClose, onUpdateStatus }: { request: ServiceRequest; onClose: () => void; onUpdateStatus?: (id: string, status: RequestStatus, vendor?: string) => void }) {
+  const [showAssignPanel, setShowAssignPanel] = useState(false)
+  const [specialtyFilter, setSpecialtyFilter] = useState<'All' | 'Electrician' | 'Plumber' | 'Carpenter'>('All')
+  const [staffList, setStaffList] = useState<StaffMember[]>(() => {
+    const storedAssignments = window.localStorage.getItem('propwise_staff_assignments')
+    const storedRequests = window.localStorage.getItem('propwise_service_requests')
+    let activeAssignments: StaffAssignment[] = []
+    if (storedAssignments) {
+      try {
+        const parsed = JSON.parse(storedAssignments)
+        if (Array.isArray(parsed)) activeAssignments = parsed
+      } catch {}
+    }
+    let reqs: ServiceRequest[] = []
+    if (storedRequests) {
+      try {
+        const parsed = JSON.parse(storedRequests)
+        if (Array.isArray(parsed)) reqs = parsed
+      } catch {}
+    }
+    return defaultStaffList.map((s) => {
+      const activeCount = reqs.filter(r => (r.vendor === s.name || activeAssignments.some(a => a.requestId === r.id && (a.staffId === s.id || a.name === s.name))) && r.status !== 'Resolved').length
+      return { ...s, active_tasks_count: activeCount }
+    })
+  })
+  const [assignNotice, setAssignNotice] = useState('')
+
+  useEffect(() => {
+    fetch('http://localhost:5000/api/users/staff')
+      .then((res) => {
+        if (!res.ok) throw new Error('Failed to fetch staff')
+        return res.json()
+      })
+      .then((data: Array<{ id: number | string; name: string; email: string; phone?: string; specialty?: string; active_tasks_count?: string | number }>) => {
+        if (Array.isArray(data) && data.length > 0) {
+          const mapped: StaffMember[] = data.map((s) => ({
+            id: s.id,
+            name: s.name,
+            email: s.email,
+            phone: s.phone || '+91 98765 43210',
+            specialty: s.specialty || 'Specialist',
+            active_tasks_count: Number(s.active_tasks_count) || 0,
+            category: s.specialty ? `${s.specialty} Specialist` : 'General Maintenance'
+          }))
+          setStaffList(mapped)
+        }
+      })
+      .catch(() => {
+        /* fallback to defaultStaffList with computed counts */
+      })
+  }, [])
+
+  const matchesCategory = (specialty?: string, category?: string) => {
+    if (!specialty || !category) return false
+    const s = specialty.toLowerCase()
+    const c = category.toLowerCase()
+    if (c.includes('plumb') && s.includes('plumb')) return true
+    if (c.includes('electr') && s.includes('electr')) return true
+    if (c.includes('carpent') && s.includes('carpent')) return true
+    if (c.includes('hvac') && (s.includes('electr') || s.includes('plumb'))) return true
+    return false
+  }
+
+  const handleAutoAssign = () => {
+    const matchingStaff = staffList.filter(s => matchesCategory(s.specialty, request.category))
+    const pool = matchingStaff.length > 0 ? matchingStaff : staffList
+    const freeStaff = pool.filter((s) => s.active_tasks_count === 0)
+    const selected = freeStaff.length > 0
+      ? freeStaff[Math.floor(Math.random() * freeStaff.length)]
+      : [...pool].sort((a, b) => a.active_tasks_count - b.active_tasks_count)[0]
+
+    if (selected && onUpdateStatus) {
+      onUpdateStatus(request.id, 'Arriving', selected.name)
+      saveStaffAssignment(request.id, selected)
+      setAssignNotice(`⚡ Auto-assigned to ${selected.name} (${selected.specialty ?? 'Specialist'})`)
+      setTimeout(() => {
+        onClose()
+      }, 1100)
+    }
+  }
+
+  const handleManualAssign = (staff: StaffMember) => {
+    if (onUpdateStatus) {
+      onUpdateStatus(request.id, 'Arriving', staff.name)
+      saveStaffAssignment(request.id, staff)
+      setAssignNotice(`Assigned to ${staff.name} (${staff.specialty ?? 'Specialist'})`)
+      setTimeout(() => {
+        onClose()
+      }, 1000)
+    }
+  }
+
+  const saveStaffAssignment = (requestId: string, staff: StaffMember) => {
+    const stored = window.localStorage.getItem('propwise_staff_assignments')
+    let assignments: StaffAssignment[] = []
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored)
+        if (Array.isArray(parsed)) assignments = parsed
+      } catch {
+        assignments = []
+      }
+    }
+    const nextAssignment: StaffAssignment = {
+      requestId,
+      staffId: staff.id,
+      name: staff.name,
+      email: staff.email,
+      phone: staff.phone,
+      specialty: staff.specialty,
+      category: staff.category ?? 'Specialist',
+      assignedAt: new Date().toISOString(),
+    }
+    const next = [...assignments.filter((assignment) => assignment.requestId !== requestId), nextAssignment]
+    window.localStorage.setItem('propwise_staff_assignments', JSON.stringify(next))
+    window.dispatchEvent(new Event('propwise_staff_assignment_updated'))
+
+    // Also inject into propwise_staff_tasks so staff sees it in their queue
+    const storedTasks = window.localStorage.getItem('propwise_staff_tasks')
+    let staffTasks: StaffTask[] = []
+    if (storedTasks) {
+      try { staffTasks = JSON.parse(storedTasks) } catch {}
+    }
+    const existingIndex = staffTasks.findIndex(t => t.id === requestId)
+    const taskItem: StaffTask = {
+      id: requestId,
+      title: request.title,
+      property: request.property,
+      category: request.category,
+      priority: request.priority,
+      status: 'In progress',
+      due: 'Today',
+      tenantPhone: staff.phone
+    }
+    if (existingIndex >= 0) {
+      staffTasks[existingIndex] = { ...staffTasks[existingIndex], ...taskItem }
+    } else {
+      staffTasks.unshift(taskItem)
+    }
+    window.localStorage.setItem('propwise_staff_tasks', JSON.stringify(staffTasks))
+
+    const rawId = requestId.replace('REQ-', '')
+    if (!isNaN(Number(rawId))) {
+      fetch(`${API_BASE}/requests/${rawId}/assign`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ staff_id: staff.id, status: 'Arriving' }),
+      }).catch((error) => console.warn('Assignment persistence warning:', error))
+    }
+  }
+
+  const filteredStaff = staffList.filter((s) => {
+    if (specialtyFilter === 'All') return true
+    return s.specialty === specialtyFilter
+  })
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+      <section className="modal-card request-detail" role="dialog" aria-modal="true" aria-labelledby="request-detail-title" style={{ maxWidth: showAssignPanel ? '660px' : '520px' }}>
+        <div className="modal-heading">
+          <div><p className="eyebrow">{request.id} · {request.category.toUpperCase()}</p><h2 id="request-detail-title">{request.title}</h2><p className="muted">Opened {request.created} at {request.property}</p></div>
+          <button className="modal-close" type="button" onClick={onClose} aria-label="Close">×</button>
+        </div>
+
+        <div className="detail-grid">
+          <div><small>Priority</small><strong className={`priority priority-${request.priority.toLowerCase()}`}>{request.priority}</strong></div>
+          <div><small>Status</small><strong>{request.status}</strong></div>
+          <div><small>Assigned to</small><strong>{request.vendor}</strong></div>
+          <div><small>Property</small><strong>{request.property}</strong></div>
+        </div>
+
+        <div className="request-timeline">
+          <span className="timeline-dot active" />
+          <div><strong>Request created</strong><small>{request.created}</small></div>
+          <span className="timeline-line" />
+          <span className={`timeline-dot ${request.status !== 'Open' ? 'active' : ''}`} />
+          <div><strong>Work {request.status === 'Resolved' ? 'completed' : 'in progress'}</strong><small>{request.status === 'Open' ? 'Awaiting assignment' : request.vendor}</small></div>
+        </div>
+
+        {assignNotice && (
+          <div className="profile-success" style={{ marginTop: '16px', background: '#eefcf5', color: '#116641', padding: '12px 16px', borderRadius: '8px', fontSize: '13px', fontWeight: 600 }}>
+            {assignNotice}
+          </div>
+        )}
+
+        {showAssignPanel && (
+          <div className="staff-assign-panel" style={{ marginTop: '18px', padding: '16px', background: '#f8f7fc', borderRadius: '12px', border: '1px solid #e5e3f0' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px', flexWrap: 'wrap', gap: '8px' }}>
+              <div>
+                <strong style={{ fontSize: '14px', color: '#1e1a34' }}>Assign Specialist Staff</strong>
+                <p style={{ margin: 0, fontSize: '11px', color: '#686578' }}>Select a qualified specialist for {request.category}</p>
+              </div>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleAutoAssign}
+                style={{ background: 'linear-gradient(135deg, #6956d8 0%, #8f7ef5 100%)', color: '#fff', padding: '8px 14px', fontSize: '12px', borderRadius: '7px', cursor: 'pointer', border: 'none', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '6px', boxShadow: '0 2px 6px rgba(105,86,216,0.25)' }}
+              >
+                <span>⚡ Auto Assign</span>
+              </button>
+            </div>
+
+            {/* Specialty filter pills */}
+            <div style={{ display: 'flex', gap: '6px', marginBottom: '12px', flexWrap: 'wrap' }}>
+              {(['All', 'Electrician', 'Plumber', 'Carpenter'] as const).map(spec => (
+                <button
+                  key={spec}
+                  type="button"
+                  onClick={() => setSpecialtyFilter(spec)}
+                  style={{
+                    padding: '4px 10px',
+                    borderRadius: '16px',
+                    fontSize: '11px',
+                    fontWeight: 600,
+                    border: '1px solid',
+                    borderColor: specialtyFilter === spec ? '#6956d8' : '#e0ddf1',
+                    background: specialtyFilter === spec ? '#6956d8' : '#fff',
+                    color: specialtyFilter === spec ? '#fff' : '#575466',
+                    cursor: 'pointer'
+                  }}
+                >
+                  {spec === 'Electrician' ? '⚡ ' : spec === 'Plumber' ? '🔧 ' : spec === 'Carpenter' ? '🪚 ' : ''}{spec}
+                </button>
+              ))}
+            </div>
+
+            <div className="staff-list-container" style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '240px', overflowY: 'auto' }}>
+              {filteredStaff.map((staff) => {
+                const isFree = staff.active_tasks_count === 0
+                const isMatch = matchesCategory(staff.specialty, request.category)
+                return (
+                  <div
+                    key={staff.id}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '10px 12px',
+                      background: isMatch ? '#fbfaff' : '#fff',
+                      borderRadius: '8px',
+                      border: isMatch ? '1px solid #cfc7f8' : '1px solid #e8e6f2'
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      <div className="avatar small" style={{ background: '#ede9fe', color: '#6956d8', fontWeight: 700 }}>
+                        {staff.name.slice(0, 2).toUpperCase()}
+                      </div>
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <strong style={{ fontSize: '13px', color: '#2b2738' }}>{staff.name}</strong>
+                          {staff.specialty && (
+                            <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '10px', background: '#f0edff', color: '#6956d8', fontWeight: 600 }}>
+                              {staff.specialty === 'Electrician' ? '⚡ ' : staff.specialty === 'Plumber' ? '🔧 ' : staff.specialty === 'Carpenter' ? '🪚 ' : ''}{staff.specialty}
+                            </span>
+                          )}
+                          {isMatch && (
+                            <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '10px', background: '#eefcf5', color: '#116641', fontWeight: 600 }}>
+                              Recommended
+                            </span>
+                          )}
+                        </div>
+                        <small style={{ fontSize: '11px', color: '#726e85' }}>{staff.email} · {staff.phone}</small>
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      <span
+                        style={{
+                          fontSize: '11px',
+                          fontWeight: 600,
+                          padding: '3px 8px',
+                          borderRadius: '12px',
+                          background: isFree ? '#eefcf5' : '#fff8ea',
+                          color: isFree ? '#116641' : '#b25900',
+                          border: isFree ? '1px solid #b7f0d0' : '1px solid #ffe3b3'
+                        }}
+                      >
+                        {isFree ? '🟢 Free' : `🟡 In work (${staff.active_tasks_count})`}
+                      </span>
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        onClick={() => handleManualAssign(staff)}
+                        style={{ padding: '6px 12px', fontSize: '11px', height: 'auto', background: isMatch ? '#6956d8' : '#fff', color: isMatch ? '#fff' : '#6254bd' }}
+                      >
+                        Assign
+                      </button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {onUpdateStatus && !assignNotice && (
+          <div className="modal-actions" style={{ marginTop: '20px', gap: '10px', display: 'flex', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+            {request.status === 'Open' && !showAssignPanel && (
+              <button className="primary-button" type="button" onClick={() => setShowAssignPanel(true)}>
+                Assign Specialist Staff
+              </button>
+            )}
+            {request.status === 'Open' && showAssignPanel && (
+              <button className="primary-button" type="button" onClick={handleAutoAssign}>
+                ⚡ Auto Assign
+              </button>
+            )}
+            {request.status !== 'Resolved' && (
+              <button className="secondary-button" type="button" onClick={() => { onUpdateStatus(request.id, 'Resolved', request.vendor); onClose(); }}>
+                Mark as Resolved
+              </button>
+            )}
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
+function GlobalSearch({ onClose, properties, serviceRequests = [] }: { onClose: () => void; properties: Property[]; serviceRequests?: ServiceRequest[] }) {
   const [query, setQuery] = useState('')
   const results = useMemo(() => {
     const normalized = query.toLowerCase().trim()
@@ -302,8 +859,30 @@ function GlobalSearch({ onClose, properties }: { onClose: () => void; properties
       ...properties.filter((property) => `${property.name} ${property.location}`.toLowerCase().includes(normalized)).map((property) => ({ type: 'Property', title: property.name, detail: property.location })),
       ...serviceRequests.filter((request) => `${request.id} ${request.title} ${request.property}`.toLowerCase().includes(normalized)).map((request) => ({ type: 'Request', title: request.title, detail: `${request.id} · ${request.property}` })),
     ]
-  }, [properties, query])
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal-card search-modal" role="dialog" aria-modal="true" aria-labelledby="global-search-title"><div className="modal-heading"><div><p className="eyebrow">WORKSPACE SEARCH</p><h2 id="global-search-title">Find anything</h2></div><button className="modal-close" type="button" onClick={onClose} aria-label="Close">×</button></div><input className="global-search-input" autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search properties, requests, or IDs…" />{query && <div className="search-results">{results.map((result) => <div className="search-result" key={`${result.type}-${result.title}`}><span>{result.type}</span><div><strong>{result.title}</strong><small>{result.detail}</small></div></div>)}{results.length === 0 && <p className="empty-state">No matching workspace records.</p>}</div>}<p className="search-hint">Search is scoped to your current organization.</p></section></div>
+  }, [properties, serviceRequests, query])
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+      <section className="modal-card search-modal" role="dialog" aria-modal="true" aria-labelledby="global-search-title">
+        <div className="modal-heading">
+          <div><p className="eyebrow">WORKSPACE SEARCH</p><h2 id="global-search-title">Find anything</h2></div>
+          <button className="modal-close" type="button" onClick={onClose} aria-label="Close">×</button>
+        </div>
+        <input className="global-search-input" autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search properties, requests, or IDs…" />
+        {query && (
+          <div className="search-results">
+            {results.map((result) => (
+              <div className="search-result" key={`${result.type}-${result.title}`}>
+                <span>{result.type}</span>
+                <div><strong>{result.title}</strong><small>{result.detail}</small></div>
+              </div>
+            ))}
+            {results.length === 0 && <p className="empty-state">No matching workspace records.</p>}
+          </div>
+        )}
+        <p className="search-hint">Search is scoped to your current organization.</p>
+      </section>
+    </div>
+  )
 }
 
 function NotificationsPanel({ notifications, onClose, onRead, onReadAll }: { notifications: Notification[]; onClose: () => void; onRead: (id: string) => void; onReadAll: () => void }) {
@@ -372,7 +951,7 @@ function LandingPage() {
       <header className="landing-nav">
         <Link className="landing-brand" to="/"><span className="brand-mark">P</span> propwise</Link>
         <nav><a href="#features">Features</a><a href="#workflow">How it works</a><a href="#security">Security</a></nav>
-        <Link className="landing-login" to="/manager/dashboard">Sign in</Link>
+        <Link className="landing-login" to="/login">Sign in</Link>
       </header>
       <main>
         <section className="landing-hero">
@@ -380,7 +959,7 @@ function LandingPage() {
             <p className="eyebrow">PROPERTY OPERATIONS, SIMPLIFIED</p>
             <h1>Smarter property operations. <em>Happier tenants.</em></h1>
             <p className="hero-subtitle">Connect tenants, property managers, and staff through one intelligent operations platform.</p>
-            <div className="hero-actions"><Link className="primary-button" to="/manager/dashboard">Explore the platform</Link><a className="secondary-button" href="#workflow">See how it works</a></div>
+            <div className="hero-actions"><Link className="primary-button" to="/login">Explore the platform</Link><a className="secondary-button" href="#workflow">See how it works</a></div>
             <div className="trust-row"><span className="trust-avatars">JD&nbsp; MK&nbsp; AL</span><span>Trusted by modern property teams</span></div>
           </div>
           <div className="hero-preview"><div className="preview-top"><span className="preview-dot" /><span>Portfolio overview</span><span className="preview-menu">•••</span></div><div className="preview-number"><small>Occupancy rate</small><strong>94.2%</strong><span>1.8% increase</span></div><div className="preview-bars"><i /><i /><i /><i /><i /><i /></div><div className="preview-footer"><span>Apr</span><span>May</span><span>Jun</span><span>Jul</span><span>Aug</span><span>Sep</span></div></div>
@@ -389,7 +968,7 @@ function LandingPage() {
         <section className="landing-section" id="features"><p className="eyebrow">EVERYTHING IN ONE PLACE</p><h2>Run your properties with clarity.</h2><p className="section-subtitle">Replace scattered spreadsheets and messages with a connected workspace designed for real-world property operations.</p><div className="feature-grid"><Feature icon="⌂" title="Portfolio visibility" text="See occupancy, revenue and property health at a glance." /><Feature icon="⚒" title="Faster maintenance" text="Move every request from report to resolution with a clear history." /><Feature icon="◉" title="Connected teams" text="Keep tenants, staff and managers aligned in one workflow." /></div></section>
         <section className="workflow-section" id="workflow"><div><p className="eyebrow">A BETTER WAY TO WORK</p><h2>From issue to resolution, without the chaos.</h2></div><div className="workflow-steps"><Step number="01" title="Tenant reports" text="A simple request form captures the right details from day one." /><Step number="02" title="Manager coordinates" text="Prioritize, assign and schedule work with complete context." /><Step number="03" title="Everyone stays informed" text="Updates, proof and feedback keep the whole team moving." /></div></section>
         <section className="security-section" id="security"><div><p className="eyebrow">BUILT FOR TRUST</p><h2>Your operations, protected.</h2><p className="section-subtitle">Role-aware workspaces and property-level visibility help every person see exactly what they need.</p></div><div className="security-points"><span>✓ Role-based access</span><span>✓ Complete request history</span><span>✓ Secure by design</span></div></section>
-        <section className="landing-cta"><h2>Make every property run better.</h2><p>Bring your team together with a clearer way to manage operations.</p><Link className="primary-button" to="/manager/dashboard">Get started</Link></section>
+        <section className="landing-cta"><h2>Make every property run better.</h2><p>Bring your team together with a clearer way to manage operations.</p><Link className="primary-button" to="/login">Get started</Link></section>
       </main>
       <footer className="landing-footer"><span className="landing-brand"><span className="brand-mark">P</span> propwise</span><span>© 2025 Propwise. Property operations, simplified.</span></footer>
       <QuickPageNavigator />
@@ -526,7 +1105,7 @@ function RoutePlaceholder({ name }: { name: string }) {
     Tenants: {
       subtitle: 'Keep resident information, leases, and communication organized.',
       metrics: [['Active tenants', '342', '+12 this month'], ['Renewals due', '18', 'Next 30 days'], ['Open balances', '₹24,680', '9 accounts'], ['Satisfaction', '4.8/5', '+0.3 vs last month']],
-      headers: ['Tenant', 'Property', 'Unit', 'Lease ends', 'Balance', 'Status'],
+      headers: ['Tenant', 'Email', 'Property', 'Unit', 'Lease ends', 'Status'],
       rows: [['Aarav Sharma', 'The Franklin', '4B', 'Oct 31, 2025', '₹0', 'Current'], ['Priya Nair', 'Lakeside Commons', '2A', 'Nov 15, 2025', '₹8,400', 'Payment due'], ['Rohan Mehta', 'Parkview Residences', '7C', 'Dec 01, 2025', '₹0', 'Current'], ['Ananya Iyer', 'Willow Creek', '12A', 'Sep 30, 2025', '₹4,200', 'Renewal due'], ['Vikram Rao', 'The Franklin', '9D', 'Jan 12, 2026', '₹0', 'Current']],
     },
     Maintenance: {
@@ -612,8 +1191,35 @@ function RoutePlaceholder({ name }: { name: string }) {
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('All')
   const [rows, setRows] = useState(data?.rows ?? [])
+  const [liveDataError, setLiveDataError] = useState('')
   const [showAdd, setShowAdd] = useState(false)
   const [notice, setNotice] = useState('')
+  const { requests: liveRequests } = useServiceRequests()
+
+  useEffect(() => {
+    if (name === 'Maintenance' || name === 'Tenant Maintenance' || name === 'Staff Maintenance') {
+      setRows(liveRequests.map(r => [r.title, r.property, r.category, r.priority, r.vendor, r.status]))
+      return
+    }
+    if (name !== 'Tenants' && name !== 'Users') return
+    const endpoint = name === 'Tenants' ? 'users/tenants' : 'users'
+    fetch(`http://localhost:5000/api/${endpoint}`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error('Unable to load users')
+        return response.json() as Promise<Array<{ name: string; email: string; role: string; created_at?: string }>>
+      })
+      .then((users) => {
+        const visibleUsers = name === 'Tenants' ? users.filter((item) => item.role === 'tenant') : users
+        setRows(visibleUsers.map((item) => [
+          item.name,
+          item.email,
+          ...(name === 'Tenants'
+            ? [item.email, 'Unassigned', '—', '—', 'Current']
+            : [item.role.replace('_', ' '), 'Propwise Management', item.created_at ? new Date(item.created_at).toLocaleDateString() : '—', 'Active']),
+        ]))
+      })
+      .catch(() => setLiveDataError('Showing saved demo records because the backend could not be reached.'))
+  }, [name, liveRequests])
   const filteredRows = rows.filter((row) => {
     const matchesSearch = row.join(' ').toLowerCase().includes(search.toLowerCase())
     const matchesFilter = filter === 'All' || row[row.length - 1] === filter
@@ -630,38 +1236,25 @@ function RoutePlaceholder({ name }: { name: string }) {
     setNotice(`${name} export downloaded.`)
   }
   if (!data) return (
-    <div className="placeholder-page">
-      <Link className="landing-brand" to="/"><span className="brand-mark">P</span> propwise</Link>
-      <p className="eyebrow">SYSTEM MESSAGE</p>
-      <h1>{name}</h1>
-      <p>This workspace page is ready for deployment.</p>
-      <button className="primary-button" type="button" onClick={() => navigate(user ? rolePath(user.role) : '/manager/dashboard')}>Back to dashboard</button>
-      <QuickPageNavigator />
-    </div>
+    <RoleShell navItems={getNavItemsForRole(user?.role)} breadcrumb={name}>
+      <section className="placeholder-page">
+        <p className="eyebrow">SYSTEM MESSAGE</p>
+        <h1>{name}</h1>
+        <p>This workspace page is ready for deployment.</p>
+        <button className="primary-button" type="button" onClick={() => navigate(user ? rolePath(user.role) : '/login')}>Back to dashboard</button>
+      </section>
+    </RoleShell>
   )
   return (
-    <div className="app-shell mock-page">
-      <aside className="mock-sidebar">
-        <Link className="brand" to={user ? rolePath(user.role) : '/manager/dashboard'}><span className="brand-mark">P</span><span>propwise</span></Link>
-        <p className="workspace-label">WORKSPACE</p>
-        <p className="mock-side-note">You are viewing the {name.toLowerCase()} workspace.</p>
-        <button className="primary-button" type="button" onClick={() => navigate(user ? rolePath(user.role) : '/manager/dashboard')}>Dashboard</button>
-      </aside>
-      <main className="main-content">
-        <header className="topbar">
-          <div className="breadcrumb">Workspace <span>/</span> {name}</div>
-          <div className="top-actions">
-            <span className="avatar small">{user?.name.slice(0, 2).toUpperCase() ?? 'JD'}</span>
-            <strong>{user?.name ?? 'Jordan Davis'}</strong>
-          </div>
-        </header>
-        <div className="content">
+    <RoleShell navItems={getNavItemsForRole(user?.role)} breadcrumb={name}>
+      <div className="mock-page">
           <section className="page-heading">
             <div>
               <p className="eyebrow">WORKSPACE / {name.toUpperCase()}</p>
               <h1>{name}</h1>
               <p className="muted">{data.subtitle}</p>
               {notice && <p className="profile-success" role="status">{notice}</p>}
+              {liveDataError && <p className="muted" role="status">{liveDataError}</p>}
             </div>
             <div className="heading-actions">
               <button className="secondary-button" type="button" onClick={exportRows}>Export</button>
@@ -706,11 +1299,9 @@ function RoutePlaceholder({ name }: { name: string }) {
               <span className="page-number">Page 1</span>
             </div>
           </section>
-        </div>
-      </main>
+      </div>
       {showAdd && <MockRecordModal name={name} headers={data.headers} onClose={() => setShowAdd(false)} onAdd={(record) => { setRows((current) => [record, ...current]); setShowAdd(false); setNotice('New record added.') }} />}
-      <QuickPageNavigator />
-    </div>
+    </RoleShell>
   )
 }
 
@@ -757,7 +1348,7 @@ function RoleShell({ navItems, breadcrumb, children }: { navItems: string[][]; b
         <div className="workspace-label">WORKSPACE</div>
         <nav aria-label="Main navigation">
           {navItems.map(([label, icon, path]) => (
-            <button className={`nav-item ${location.pathname === path ? 'active' : ''}`} key={label} onClick={() => { navigate(path); setMobileNavOpen(false) }} type="button">
+            <button className={`nav-item ${location.pathname === path ? 'active' : ''}`} key={label} onClick={() => { navigate(path); setMobileNavOpen(false) }} type="button" aria-current={location.pathname === path ? 'page' : undefined}>
               <span className="nav-icon">{icon}</span>{label}
             </button>
           ))}
@@ -815,8 +1406,100 @@ const auditLog = [
   { user: 'Sam Rivera',   action: 'Changed user role',  target: 'Chris Lee → Staff',    time: 'Sep 19, 2025'       },
 ]
 
+function StaffDirectoryPage() {
+  const [staff, setStaff] = useState<StaffMember[]>(defaultStaffList)
+  const [showAdd, setShowAdd] = useState(false)
+  const [notice, setNotice] = useState('')
+  const [form, setForm] = useState({ name: '', email: '', password: 'demo123', specialty: 'Electrician', phone: '' })
+
+  const loadStaff = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/users/staff`)
+      if (!response.ok) throw new Error('Failed to load staff')
+      const data = await response.json()
+      if (Array.isArray(data)) setStaff(data)
+    } catch (error) {
+      console.warn('Staff directory fallback:', error)
+    }
+  }
+
+  useEffect(() => { loadStaff() }, [])
+
+  const createStaff = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    try {
+      const response = await fetch(`${API_BASE}/users/staff`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
+      })
+      if (!response.ok) throw new Error('Failed to create staff account')
+      setShowAdd(false)
+      setForm({ name: '', email: '', password: 'demo123', specialty: 'Electrician', phone: '' })
+      setNotice('Staff account created.')
+      loadStaff()
+    } catch (error) {
+      setNotice('Staff account could not be saved while the database is unavailable.')
+    }
+  }
+
+  const updateStaff = async (member: StaffMember) => {
+    try {
+      const response = await fetch(`${API_BASE}/users/staff/${member.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: member.name, email: member.email, specialty: member.specialty, phone: member.phone }),
+      })
+      if (!response.ok) throw new Error('Failed to update staff account')
+      setNotice(`${member.name} updated.`)
+      loadStaff()
+    } catch (error) {
+      setNotice('Staff account could not be updated while the database is unavailable.')
+    }
+  }
+
+  const deactivateStaff = async (member: StaffMember) => {
+    try {
+      const response = await fetch(`${API_BASE}/users/staff/${member.id}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error('Failed to deactivate staff account')
+      setNotice(`${member.name} deactivated.`)
+      loadStaff()
+    } catch (error) {
+      setNotice('Staff account could not be deactivated while the database is unavailable.')
+    }
+  }
+
+  return (
+    <RoleShell navItems={adminNav} breadcrumb="Staff Directory">
+      <section className="page-heading">
+        <div><p className="eyebrow">STAFF MANAGEMENT · SPECIALIST ACCOUNTS</p><h1>Staff directory</h1><p className="muted">Manage specialties, contact numbers, and active staff access.</p></div>
+        <button className="primary-button" type="button" onClick={() => setShowAdd(true)}><span>+</span> Add staff</button>
+      </section>
+      {notice && <p className="profile-success" role="status">{notice}</p>}
+      <section className="card">
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>STAFF</th><th>SPECIALTY</th><th>PHONE</th><th>ACTIVE TASKS</th><th>ACTIONS</th></tr></thead>
+            <tbody>{staff.map(member => (
+              <tr key={member.id}>
+                <td><strong>{member.name}</strong><small>{member.email}</small></td>
+                <td><select className="filter-select" value={member.specialty || ''} onChange={event => setStaff(current => current.map(item => item.id === member.id ? { ...item, specialty: event.target.value } : item))}><option value="">General</option><option>Electrician</option><option>Plumber</option><option>Carpenter</option></select></td>
+                <td><input className="inline-edit" value={member.phone || ''} onChange={event => setStaff(current => current.map(item => item.id === member.id ? { ...item, phone: event.target.value } : item))} /></td>
+                <td>{member.active_tasks_count}</td>
+                <td><button className="secondary-button task-action" type="button" onClick={() => updateStaff(member)}>Save</button><button className="text-button staff-deactivate" type="button" onClick={() => deactivateStaff(member)}>Deactivate</button></td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      </section>
+      {showAdd && <div className="modal-backdrop" role="presentation"><section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="add-staff-title"><div className="modal-heading"><div><p className="eyebrow">STAFF MANAGEMENT</p><h2 id="add-staff-title">Add staff account</h2></div><button className="modal-close" type="button" onClick={() => setShowAdd(false)} aria-label="Close">×</button></div><form className="property-form" onSubmit={createStaff}><label>Name<input required value={form.name} onChange={event => setForm({ ...form, name: event.target.value })} /></label><label>Email<input required type="email" value={form.email} onChange={event => setForm({ ...form, email: event.target.value })} /></label><label>Temporary password<input required value={form.password} onChange={event => setForm({ ...form, password: event.target.value })} /></label><label>Specialty<select value={form.specialty} onChange={event => setForm({ ...form, specialty: event.target.value })}><option>Electrician</option><option>Plumber</option><option>Carpenter</option></select></label><label>Phone<input value={form.phone} onChange={event => setForm({ ...form, phone: event.target.value })} /></label><div className="modal-actions"><button className="secondary-button modal-cancel" type="button" onClick={() => setShowAdd(false)}>Cancel</button><button className="primary-button" type="submit">Create account</button></div></form></section></div>}
+    </RoleShell>
+  )
+}
+
 function AdminDashboardPage() {
   const { user } = useAuth()
+  const availableHomes = getAvailableUnits(initialProperties)
   return (
     <RoleShell navItems={adminNav} breadcrumb="Admin Overview">
       <section className="page-heading">
@@ -834,6 +1517,7 @@ function AdminDashboardPage() {
       <section className="metric-grid" aria-label="System summary">
         <Metric label="Total users"        value="6"          change="+2 this quarter"      icon="♙" positive />
         <Metric label="Active properties"  value="5"          change="350 total units"      icon="⌂" positive />
+        <Metric label="Available homes"    value={String(availableHomes)} change="Ready to lease"       icon="⌂" positive />
         <Metric label="Monthly revenue"    value="₹4,77,350"  change="+8.4% vs last month"  icon="₹" positive />
         <Metric label="System alerts"      value="2"          change="1 critical pending"   icon="⚠" warning />
       </section>
@@ -909,12 +1593,6 @@ const tenantNav = [
   ['Announcements', '♢', '/tenant/announcements'],
 ]
 
-const myMaintenanceRequests: ServiceRequest[] = [
-  { id: 'REQ-1043', title: 'Bathroom faucet dripping',  property: 'The Franklin', category: 'Plumbing',  priority: 'Medium', status: 'Open',        vendor: 'Unassigned',      created: 'Today'   },
-  { id: 'REQ-1040', title: 'AC not cooling',             property: 'The Franklin', category: 'HVAC',      priority: 'High',   status: 'In progress', vendor: 'CoolAir Services', created: 'Sep 5'   },
-  { id: 'REQ-1035', title: 'Window seal broken',         property: 'The Franklin', category: 'General',   priority: 'Low',    status: 'Resolved',    vendor: 'In-house',        created: 'Aug 28'  },
-]
-
 const myPaymentHistory = [
   { description: 'Rent – September 2025', amount: '₹28,500', date: 'Sep 1, 2025',  status: 'Paid' },
   { description: 'Rent – August 2025',    amount: '₹28,500', date: 'Aug 1, 2025',  status: 'Paid' },
@@ -923,8 +1601,24 @@ const myPaymentHistory = [
 
 function TenantDashboardPage() {
   const { user } = useAuth()
+  const availableHomes = getAvailableUnits(initialProperties)
   const [showNewRequest, setShowNewRequest] = useState(false)
-  const [tenantRequests, setTenantRequests] = useState(myMaintenanceRequests)
+  const [showPrepayOptions, setShowPrepayOptions] = useState(false)
+  const [selectedPrepay, setSelectedPrepay] = useState('Next month · ₹28,500')
+  const [assignments, setAssignments] = useState<StaffAssignment[]>(() => readStaffAssignments())
+  const { requests: tenantRequests, addRequest } = useServiceRequests('tenant', user?.id)
+
+  useEffect(() => {
+    const refreshAssignments = () => setAssignments(readStaffAssignments())
+    window.addEventListener('propwise_staff_assignment_updated', refreshAssignments)
+    return () => window.removeEventListener('propwise_staff_assignment_updated', refreshAssignments)
+  }, [])
+
+  const assignedRequests = tenantRequests
+    .map((request) => ({ request, assignment: assignments.find((item) => item.requestId === request.id) }))
+    .filter(({ assignment }) => Boolean(assignment))
+  const completedRequests = tenantRequests.filter((request) => request.status === 'Resolved').length
+  const assignedStaffCount = new Set(assignedRequests.map(({ assignment }) => assignment?.staffId)).size
 
   return (
     <RoleShell navItems={tenantNav} breadcrumb="My Home">
@@ -943,6 +1637,9 @@ function TenantDashboardPage() {
         <Metric label="Next rent due"   value="Oct 1"    change="₹28,500 due"          icon="₹"  />
         <Metric label="Lease ends"      value="Oct 31"   change="Renewal available"      icon="▤"  />
         <Metric label="Open requests"   value={String(tenantRequests.filter(r => r.status !== 'Resolved').length)} change="1 in progress" icon="⚒" />
+        <Metric label="Available homes" value={String(availableHomes)} change="Across Propwise portfolio" icon="⌂" positive />
+        <Metric label="Assigned staff"  value={String(assignedStaffCount)} change="Working on your requests" icon="♙" />
+        <Metric label="Completed work"  value={String(completedRequests)} change="Requests resolved" icon="✓" positive />
         <Metric label="Satisfaction"    value="4.9/5"    change="Based on your reviews" icon="★"  positive />
       </section>
 
@@ -969,6 +1666,64 @@ function TenantDashboardPage() {
         </article>
 
         <div style={{display:'flex',flexDirection:'column',gap:'17px'}}>
+          <article className="card rent-payment-card">
+            <div className="card-heading">
+              <div><p className="eyebrow" style={{marginBottom:'7px'}}>RENT DUE</p><h2>Pay your rent</h2><p className="muted">₹28,500 due Oct 1, 2025</p></div>
+              <span className="status status-warning"><i />Due soon</span>
+            </div>
+            <div className="rent-payment-content">
+              <div className="payment-qr" aria-label="QR code for rent payment">
+                <QrCode />
+              </div>
+              <div className="rent-payment-details">
+                <strong>Scan to pay securely</strong>
+                <small>UPI ID: propwise.rent@upi</small>
+                <button className="primary-button" type="button" onClick={() => setShowPrepayOptions(true)}>Prepay rent</button>
+              </div>
+            </div>
+            {showPrepayOptions && (
+              <div className="prepay-options">
+                <strong>Choose a prepayment</strong>
+                {['Current rent · ₹28,500', 'Next month · ₹28,500', 'Two months · ₹57,000'].map((option) => (
+                  <label key={option} className="prepay-option">
+                    <input type="radio" name="prepay" checked={selectedPrepay === option} onChange={() => setSelectedPrepay(option)} />
+                    <span>{option}</span>
+                  </label>
+                ))}
+                <div className="prepay-actions">
+                  <button className="secondary-button" type="button" onClick={() => setShowPrepayOptions(false)}>Cancel</button>
+                  <button className="primary-button" type="button" onClick={() => setShowPrepayOptions(false)}>Continue to pay</button>
+                </div>
+              </div>
+            )}
+          </article>
+
+          {assignedRequests.length > 0 && (
+            <article className="card assigned-staff-card">
+              <div className="card-heading"><div><h2>Your assigned staff</h2><p className="muted">People, progress, and proof status for your requests</p></div><span className="status status-info"><i />Next visit: 10:00 AM</span></div>
+              <div className="assigned-staff-list">
+                {assignedRequests.map(({ request, assignment }) => assignment && (
+                  <div className="assigned-staff-item" key={request.id}>
+                    <div className="avatar">{assignment.name.slice(0, 2).toUpperCase()}</div>
+                    <div>
+                      <strong>{assignment.name}</strong>
+                      <small>{assignment.specialty || assignment.category} · {request.title}</small>
+                      <small><a href={`mailto:${assignment.email}`}>{assignment.email}</a></small>
+                      <small><a href={`tel:${assignment.phone}`}>☎ {assignment.phone}</a></small>
+                    </div>
+                    <span className={`status status-${request.status === 'Resolved' ? 'good' : 'info'}`}><i />{request.status === 'Resolved' ? 'Completed' : 'Assigned'}</span>
+                    <div className="progress-roadmap" aria-label={`Progress for ${request.title}`}>
+                      <label><input type="checkbox" checked readOnly /> Staff assigned</label>
+                      <label><input type="checkbox" checked={request.status === 'Arriving' || request.status === 'In progress' || request.status === 'Waiting for parts' || request.status === 'Resolved'} readOnly /> Staff arriving</label>
+                      <label><input type="checkbox" checked={request.status === 'In progress' || request.status === 'Waiting for parts' || request.status === 'Resolved'} readOnly /> Work in progress</label>
+                      <label><input type="checkbox" checked={request.status === 'Resolved'} readOnly /> Work completed</label>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </article>
+          )}
+
           <article className="card" style={{background:'linear-gradient(135deg,#6956d8 0%,#8f7ef5 100%)',color:'#fff',border:'none'}}>
             <p style={{margin:'0 0 8px',fontSize:'10px',fontWeight:700,letterSpacing:'1px',opacity:.75}}>YOUR LEASE</p>
             <h2 style={{margin:'0 0 4px',color:'#fff',fontSize:'16px'}}>The Franklin, Unit 4B</h2>
@@ -995,12 +1750,70 @@ function TenantDashboardPage() {
         </div>
       </section>
 
-      {showNewRequest && <TenantRequestModal onClose={() => setShowNewRequest(false)} onSubmit={req => { setTenantRequests(r => [req, ...r]); setShowNewRequest(false) }} />}
+      {showNewRequest && (
+        <TenantRequestModal
+          onClose={() => setShowNewRequest(false)}
+          onSubmit={(req) => {
+            addRequest({
+              title: req.title,
+              property: req.property,
+              category: req.category,
+              priority: req.priority,
+              description: req.title,
+              tenant_id: user?.id
+            })
+            setShowNewRequest(false)
+          }}
+        />
+      )}
     </RoleShell>
   )
 }
 
-function TenantRequestModal({ onClose, onSubmit }: { onClose: () => void; onSubmit: (r: ServiceRequest) => void }) {
+function readStaffAssignments(): StaffAssignment[] {
+  const stored = window.localStorage.getItem('propwise_staff_assignments')
+  if (!stored) return []
+  try {
+    const parsed = JSON.parse(stored)
+    return Array.isArray(parsed)
+      ? (parsed as StaffAssignment[]).map((assignment) => ({
+          ...assignment,
+          phone: assignment.phone || 'Contact number unavailable',
+        }))
+      : []
+  } catch {
+    return []
+  }
+}
+
+function QrCode() {
+  const modules = [
+    '111111100101101111111',
+    '100000101111101000001',
+    '101110100100101011101',
+    '101110101011101011101',
+    '101110100110101011101',
+    '100000101010101000001',
+    '111111101010101111111',
+    '000000001101100000000',
+    '110101111011011010101',
+    '011011001110110101110',
+    '101110111001011010011',
+    '001101010111101110100',
+    '110010111010011001011',
+    '000000001011110101100',
+    '111111101100011101011',
+    '100000101011110010101',
+    '101110101100101111000',
+    '101110100011011001101',
+    '101110101101110110010',
+    '100000100110011011101',
+    '111111101011101101011',
+  ]
+  return <svg className="qr-svg" viewBox="0 0 21 21" role="img" aria-label="Rent payment QR code">{modules.map((row, y) => [...row].map((cell, x) => cell === '1' && <rect key={`${x}-${y}`} x={x} y={y} width="1" height="1" />))}</svg>
+}
+
+function TenantRequestModal({ onClose, onSubmit }: { onClose: () => void; onSubmit: (r: { title: string; category: string; priority: Priority; property: string }) => void }) {
   const [title, setTitle] = useState('')
   const [category, setCategory] = useState('Plumbing')
   const [priority, setPriority] = useState<Priority>('Medium')
@@ -1009,8 +1822,7 @@ function TenantRequestModal({ onClose, onSubmit }: { onClose: () => void; onSubm
   const submit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     if (!title.trim()) { setError('Please describe the issue.'); return }
-    const newId = `REQ-${1044 + Math.floor(Math.random() * 900)}`
-    onSubmit({ id: newId, title: title.trim(), property: 'The Franklin', category, priority, status: 'Open', vendor: 'Unassigned', created: 'Just now' })
+    onSubmit({ title: title.trim(), property: 'The Franklin', category, priority })
   }
 
   return (
@@ -1049,46 +1861,120 @@ const staffNav = [
   ['Schedule',    '◷', '/staff/schedule'],
 ]
 
-type StaffTask = { id: string; title: string; property: string; category: string; priority: Priority; status: RequestStatus; due: string }
+function getNavItemsForRole(role?: Role) {
+  if (role === 'SUPER_ADMIN') return adminNav
+  if (role === 'TENANT') return tenantNav
+  if (role === 'STAFF') return staffNav
+  return navItems
+}
+
+type StaffTask = {
+  id: string
+  title: string
+  property: string
+  category: string
+  priority: Priority
+  status: RequestStatus
+  due: string
+  proofName?: string
+  proofUrl?: string
+  completedAt?: string
+  tenantPhone?: string
+}
 const initialStaffTasks: StaffTask[] = [
-  { id: 'TSK-221', title: 'Inspect lobby fire extinguishers', property: 'The Franklin',        category: 'Safety',     priority: 'High',   status: 'Open',        due: 'Today'  },
-  { id: 'TSK-220', title: 'Replace hallway light bulbs',      property: 'Lakeside Commons',    category: 'Electrical', priority: 'Medium', status: 'In progress', due: 'Today'  },
-  { id: 'TSK-219', title: 'Clean parking lot drains',         property: 'Parkview Residences', category: 'Sanitation', priority: 'Low',    status: 'Open',        due: 'Sep 9'  },
+  { id: 'TSK-221', title: 'Inspect lobby fire extinguishers', property: 'The Franklin',        category: 'Safety',     priority: 'High',   status: 'Open',        due: 'Today', tenantPhone: '+91 98765 40001' },
+  { id: 'TSK-220', title: 'Replace hallway light bulbs',      property: 'Lakeside Commons',    category: 'Electrical', priority: 'Medium', status: 'In progress', due: 'Today', tenantPhone: '+91 98765 40002' },
+  { id: 'TSK-219', title: 'Clean parking lot drains',         property: 'Parkview Residences', category: 'Sanitation', priority: 'Low',    status: 'Open',        due: 'Sep 9', tenantPhone: '+91 98765 40003' },
   { id: 'TSK-218', title: 'Pool chemical balance check',      property: 'Willow Creek',        category: 'Amenities',  priority: 'Medium', status: 'Resolved',    due: 'Sep 6'  },
   { id: 'TSK-217', title: 'Repaint unit 3A walls',            property: 'The Franklin',        category: 'General',    priority: 'Low',    status: 'Resolved',    due: 'Sep 5'  },
 ]
 
 function StaffDashboardPage() {
   const { user } = useAuth()
-  const [tasks, setTasks] = useState(initialStaffTasks)
+  const { requests: serviceRequests, updateRequestStatus } = useServiceRequests('staff', user?.id)
+  const [taskFilter, setTaskFilter] = useState<'All' | 'Open' | 'In progress' | 'Resolved'>('All')
+  const [isOnline, setIsOnline] = useState(() => navigator.onLine)
+  const [queuedActions, setQueuedActions] = useState(() => readOfflineActions().length)
+  const [tasks, setTasks] = useState<StaffTask[]>(() => {
+    const stored = window.localStorage.getItem('propwise_staff_tasks')
+    if (!stored) return initialStaffTasks
+    try {
+      const parsed = JSON.parse(stored)
+      return Array.isArray(parsed) ? parsed as StaffTask[] : initialStaffTasks
+    } catch {
+      return initialStaffTasks
+    }
+  })
+  const [selectedTask, setSelectedTask] = useState<StaffTask | null>(null)
 
-  const toggleTask = (id: string) =>
-    setTasks(t => t.map(task => task.id === id ? { ...task, status: (task.status === 'Resolved' ? 'Open' : 'Resolved') as RequestStatus } : task))
+  useEffect(() => {
+    window.localStorage.setItem('propwise_staff_tasks', JSON.stringify(tasks))
+  }, [tasks])
+  useEffect(() => {
+    const sync = () => {
+      setIsOnline(navigator.onLine)
+      if (navigator.onLine) flushOfflineActions()
+      setQueuedActions(readOfflineActions().length)
+    }
+    const updateQueue = () => setQueuedActions(readOfflineActions().length)
+    window.addEventListener('online', sync)
+    window.addEventListener('offline', sync)
+    window.addEventListener('propwise_offline_queue_updated', updateQueue)
+    sync()
+    return () => {
+      window.removeEventListener('online', sync)
+      window.removeEventListener('offline', sync)
+      window.removeEventListener('propwise_offline_queue_updated', updateQueue)
+    }
+  }, [])
+
+  const completeTask = (taskId: string, proof: { name: string; url: string }) => {
+    setTasks(current => current.map(task => task.id === taskId
+      ? { ...task, status: 'Resolved', proofName: proof.name, proofUrl: proof.url, completedAt: new Date().toISOString() }
+      : task))
+    setSelectedTask(null)
+  }
+
+  const reopenTask = (taskId: string) => {
+    setTasks(current => current.map(task => task.id === taskId
+      ? { ...task, status: 'Open', completedAt: undefined }
+      : task))
+  }
+  const updateLocalTaskStatus = (taskId: string, status: RequestStatus) => {
+    setTasks(current => current.map(task => task.id === taskId ? { ...task, status } : task))
+  }
 
   const open     = tasks.filter(t => t.status !== 'Resolved').length
   const overdue  = tasks.filter(t => t.status === 'Overdue').length
   const resolved = tasks.filter(t => t.status === 'Resolved').length
+  const visibleTasks = tasks.filter(task => taskFilter === 'All' || (taskFilter === 'Open' ? task.status !== 'Resolved' : task.status === taskFilter))
 
   return (
     <RoleShell navItems={staffNav} breadcrumb="Tasks">
       <section className="page-heading">
         <div>
-          <p className="eyebrow">STAFF PORTAL · OPERATIONS TEAM</p>
+          <p className="eyebrow">STAFF PORTAL · {user?.specialty || 'OPERATIONS TEAM'}</p>
           <h1>Your tasks, {user?.name.split(' ')[0]}</h1>
-          <p className="muted">Manage your daily assignments and maintenance queue. Click a row to toggle completion.</p>
+          <p className="muted">Manage your assigned work, upload proof, and keep tenants updated.</p>
         </div>
       </section>
+      <div className={`staff-connectivity ${isOnline ? 'online' : 'offline'}`} role="status">
+        <span className="connectivity-dot" />
+        {isOnline ? 'Online · changes sync automatically' : `Offline · ${queuedActions} update${queuedActions === 1 ? '' : 's'} queued for sync`}
+      </div>
 
       <section className="metric-grid" aria-label="Staff summary">
         <Metric label="Today's tasks"      value={String(tasks.filter(t => t.due === 'Today').length)} change="2 pending today"         icon="✓"  />
         <Metric label="Open tasks"         value={String(open)}    change="Across all properties"     icon="⚒" warning={overdue > 0} />
         <Metric label="Overdue"            value={String(overdue)} change={overdue === 0 ? 'All on track' : 'Needs attention'} icon="⚠" warning={overdue > 0} />
         <Metric label="Resolved this week" value={String(resolved)} change="+2 vs last week"           icon="◉" positive />
+        <Metric label="Proof submitted"    value={String(tasks.filter(t => Boolean(t.proofUrl)).length)} change="Completed tasks with evidence" icon="▤" positive />
       </section>
 
-      <section className="card" style={{marginBottom:'22px'}}>
+      <section className="card staff-dashboard-card" style={{marginBottom:'22px'}}>
         <div className="card-heading">
-          <div><h2>Task queue</h2><p className="muted">Click any row to mark as complete / reopen</p></div>
+          <div><h2>Task queue</h2><p className="muted">Upload proof before marking completed</p></div>
+        <select className="filter-select" aria-label="Filter task status" value={taskFilter} onChange={event => setTaskFilter(event.target.value as typeof taskFilter)}><option value="All">All tasks</option><option value="Open">Open</option><option value="In progress">In progress</option><option value="Resolved">Completed</option></select>
           <div style={{display:'flex',gap:'8px'}}>
             <span className="status status-good" style={{fontSize:'11px'}}><i />{resolved} resolved</span>
             <span className="status status-info" style={{fontSize:'11px'}}><i />{open} open</span>
@@ -1096,32 +1982,79 @@ function StaffDashboardPage() {
         </div>
         <div className="table-wrap">
           <table>
-            <thead><tr><th>TASK</th><th>PROPERTY</th><th>CATEGORY</th><th>PRIORITY</th><th>DUE</th><th>STATUS</th></tr></thead>
+            <thead><tr><th>TASK</th><th>PROPERTY</th><th>CATEGORY</th><th>PRIORITY</th><th>DUE</th><th>STATUS</th><th>PROOF</th><th>ACTION</th></tr></thead>
             <tbody>
-              {tasks.map(t => (
-                <tr key={t.id} className="clickable-row" onClick={() => toggleTask(t.id)} style={t.status === 'Resolved' ? {opacity:.5} : {}}>
+              {visibleTasks.map(t => (
+                <tr key={t.id} style={t.status === 'Resolved' ? {opacity:.7} : {}}>
                   <td><strong style={t.status === 'Resolved' ? {textDecoration:'line-through'} : {}}>{t.title}</strong><small>{t.id}</small></td>
                   <td>{t.property}</td>
                   <td>{t.category}</td>
                   <td><span className={`priority priority-${t.priority.toLowerCase()}`}>{t.priority}</span></td>
                   <td>{t.due}</td>
                   <td><span className={`status status-${t.status === 'Resolved' ? 'good' : t.status === 'Overdue' ? 'warning' : 'info'}`}><i />{t.status}</span></td>
+                  <td>
+                    {t.proofUrl
+                      ? <a className="proof-link" href={t.proofUrl} target="_blank" rel="noreferrer" onClick={event => event.stopPropagation()}>{t.proofName || 'View proof'}</a>
+                      : <small>No proof uploaded</small>}
+                  </td>
+                  <td>
+                    {t.status === 'Resolved'
+                      ? <button className="secondary-button task-action" type="button" onClick={() => reopenTask(t.id)}>Reopen</button>
+                      : <button className="primary-button task-action" type="button" onClick={() => setSelectedTask(t)}>Complete</button>}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
+        <div className="staff-mobile-task-list">
+          {visibleTasks.map(task => (
+            <article className="staff-mobile-task" key={task.id}>
+              <div className="staff-mobile-task-heading">
+                <div><strong>{task.title}</strong><small>{task.id} · {task.property}</small></div>
+                <span className={`status status-${task.status === 'Resolved' ? 'good' : task.status === 'Overdue' ? 'warning' : 'info'}`}><i />{task.status}</span>
+              </div>
+              <div className="staff-mobile-task-meta"><span>{task.category}</span><span className={`priority priority-${task.priority.toLowerCase()}`}>{task.priority}</span><span>Due {task.due}</span></div>
+              <div className="staff-mobile-actions">
+                <a className="secondary-button mobile-action" href={`tel:${task.tenantPhone || ''}`}>Call tenant</a>
+                <a className="secondary-button mobile-action" href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(task.property)}`} target="_blank" rel="noreferrer">Map</a>
+                <button className="secondary-button mobile-action" type="button" onClick={() => updateLocalTaskStatus(task.id, 'Arriving')}>Arriving</button>
+                {task.status === 'Resolved'
+                  ? <button className="secondary-button mobile-action" type="button" onClick={() => reopenTask(task.id)}>Reopen</button>
+                  : <button className="primary-button mobile-action" type="button" onClick={() => setSelectedTask(task)}>Complete</button>}
+              </div>
+            </article>
+          ))}
+        </div>
       </section>
+
+      {selectedTask && (
+        <TaskProofModal
+          task={selectedTask}
+          onClose={() => setSelectedTask(null)}
+          onSubmit={(proof) => completeTask(selectedTask.id, proof)}
+        />
+      )}
 
       <section className="dashboard-grid">
         <article className="card">
           <div className="card-heading"><div><h2>Maintenance assignments</h2><p className="muted">Requests currently assigned to staff</p></div></div>
           <div className="task-list">
-            {serviceRequests.filter(r => r.status !== 'Resolved').slice(0, 4).map(r => (
+            {serviceRequests.slice(0, 4).map(r => (
               <div className="task" key={r.id}>
                 <span className={`task-dot ${r.priority === 'High' ? 'orange' : r.priority === 'Medium' ? 'blue' : 'purple'}`} />
                 <div><strong>{r.title}</strong><small>{r.property} · {r.category} · {r.status}</small></div>
-                <span className={`priority priority-${r.priority.toLowerCase()}`} style={{marginLeft:'auto',flexShrink:0}}>{r.priority}</span>
+                <select
+                  className="progress-select"
+                  aria-label={`Update progress for ${r.title}`}
+                  value={r.status}
+                  onChange={(event) => updateRequestStatus(r.id, event.target.value as RequestStatus, r.vendor)}
+                >
+                  <option value="Arriving">Arriving</option>
+                  <option value="In progress">In progress</option>
+                  <option value="Waiting for parts">Waiting for parts</option>
+                  <option value="Resolved">Completed</option>
+                </select>
               </div>
             ))}
           </div>
@@ -1147,6 +2080,80 @@ function StaffDashboardPage() {
     </RoleShell>
   )
 }
+
+function TaskProofModal({
+  task,
+  onClose,
+  onSubmit,
+}: {
+  task: StaffTask
+  onClose: () => void
+  onSubmit: (proof: { name: string; url: string }) => void
+}) {
+  const [file, setFile] = useState<File | null>(null)
+  const [error, setError] = useState('')
+
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!file) {
+      setError('Upload a photo or document as proof before completing this task.')
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') {
+        setError('The selected proof could not be read. Please choose another file.')
+        return
+      }
+      onSubmit({ name: file.name, url: reader.result })
+    }
+    reader.onerror = () => setError('The selected proof could not be read. Please choose another file.')
+    reader.readAsDataURL(file)
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
+      <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="task-proof-title">
+        <div className="modal-heading">
+          <div>
+            <p className="eyebrow">TASK COMPLETION</p>
+            <h2 id="task-proof-title">Upload completion proof</h2>
+            <p className="muted">{task.title} · {task.property}</p>
+          </div>
+          <button className="modal-close" type="button" onClick={onClose} aria-label="Close">×</button>
+        </div>
+        <form className="property-form" onSubmit={submit}>
+          <label>
+            Proof file
+            <input
+              type="file"
+              accept="image/*,.pdf,.doc,.docx"
+              capture="environment"
+              onChange={event => { setFile(event.target.files?.[0] ?? null); setError('') }}
+              required
+            />
+          </label>
+          <p className="muted">Attach a photo of the completed work or a supporting document.</p>
+          {file && <p className="proof-selected" role="status">Selected: {file.name}</p>}
+          {error && <p className="auth-error" role="alert">{error}</p>}
+          <div className="modal-actions">
+            <button className="secondary-button modal-cancel" type="button" onClick={onClose}>Cancel</button>
+            <button className="primary-button" type="submit">Upload & complete</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  )
+}
+
+const specialtyStaffAccounts = [
+  { label: 'Ravi · Electrician', email: 'ravi.electrician@propwise.test' },
+  { label: 'Anita · Electrician', email: 'anita.electrician@propwise.test' },
+  { label: 'Vikram · Plumber', email: 'vikram.plumber@propwise.test' },
+  { label: 'Neha · Plumber', email: 'neha.plumber@propwise.test' },
+  { label: 'Arjun · Carpenter', email: 'arjun.carpenter@propwise.test' },
+  { label: 'Kavya · Carpenter', email: 'kavya.carpenter@propwise.test' },
+]
 
 function LoginPage() {
   const { user, login, rolePath } = useAuth()
@@ -1177,7 +2184,7 @@ function LoginPage() {
     }, 250)
   }
 
-  return <div className="auth-page"><div className="auth-brand"><Link className="landing-brand" to="/"><span className="brand-mark">P</span> propwise</Link></div><section className="auth-card"><p className="eyebrow">WELCOME BACK</p><h1>Sign in to Propwise</h1><p className="auth-copy">Manage your properties and keep every request moving.</p><form onSubmit={submit}><label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label><label>Password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={6} required /></label>{error && <p className="auth-error" role="alert">{error}</p>}<div className="auth-row"><label className="remember"><input type="checkbox" defaultChecked /> Remember me</label><Link to="/forgot-password">Forgot password?</Link></div><button className="primary-button auth-submit" type="submit" disabled={submitting}>{submitting ? 'Signing in…' : 'Sign in'}</button></form><div style={{textAlign: "center", marginTop: "1rem", fontSize: "14px", marginBottom: "1rem"}}>Do not have an account? <Link to="/signup" style={{color: "#6956d8", fontWeight: "bold"}}>Sign up here</Link></div>\n<div className="demo-accounts"><strong>Demo accounts (password: demo123)</strong><button type="button" onClick={() => { setEmail('manager@propwise.test'); setPassword('demo123') }}>Manager</button><button type="button" onClick={() => { setEmail('admin@propwise.test'); setPassword('demo123') }}>Admin</button><button type="button" onClick={() => { setEmail('tenant@propwise.test'); setPassword('demo123') }}>Tenant</button><button type="button" onClick={() => { setEmail('staff@propwise.test'); setPassword('demo123') }}>Staff</button></div></section></div>
+  return <div className="auth-page"><div className="auth-brand"><Link className="landing-brand" to="/"><span className="brand-mark">P</span> propwise</Link></div><section className="auth-card"><p className="eyebrow">WELCOME BACK</p><h1>Sign in to Propwise</h1><p className="auth-copy">Manage your properties and keep every request moving.</p><form onSubmit={submit}><label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label><label>Password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={6} required /></label>{error && <p className="auth-error" role="alert">{error}</p>}<div className="auth-row"><label className="remember"><input type="checkbox" defaultChecked /> Remember me</label><Link to="/forgot-password">Forgot password?</Link></div><button className="primary-button auth-submit" type="submit" disabled={submitting}>{submitting ? 'Signing in…' : 'Sign in'}</button></form><div style={{textAlign: "center", marginTop: "1rem", fontSize: "14px", marginBottom: "1rem"}}>Do not have an account? <Link to="/signup" style={{color: "#6956d8", fontWeight: "bold"}}>Sign up here</Link></div></section><aside className="demo-sidebar"><strong>Demo accounts</strong><span className="demo-sidebar-sub">password: demo123</span><button type="button" onClick={() => { setEmail('manager@propwise.test'); setPassword('demo123') }}>Manager</button><button type="button" onClick={() => { setEmail('admin@propwise.test'); setPassword('demo123') }}>Admin</button><button type="button" onClick={() => { setEmail('tenant@propwise.test'); setPassword('demo123') }}>Tenant</button><button type="button" onClick={() => { setEmail('staff@propwise.test'); setPassword('demo123') }}>Staff</button><div className="demo-staff-heading">Specialist staff</div>{specialtyStaffAccounts.map((account) => <button key={account.email} type="button" onClick={() => { setEmail(account.email); setPassword('demo123') }}>{account.label}</button>)}</aside></div>
 }
 
 
@@ -1281,15 +2288,15 @@ function AccessDeniedPage() {
 }
 
 function ProtectedRoute({ roles, children }: { roles?: Role[]; children: ReactElement }) {
-  const { user } = useAuth()
+  const { user, rolePath } = useAuth()
   const location = useLocation()
   if (!user) return <Navigate to="/login" state={{ from: location.pathname }} replace />
-  if (roles && !roles.includes(user.role) && user.role !== 'SUPER_ADMIN') return <Navigate to="/unauthorized" replace />
+  if (roles && !roles.includes(user.role) && user.role !== 'SUPER_ADMIN') return <Navigate to={rolePath(user.role)} replace />
   return children
 }
 
 function ProfilePage() {
-  const { user, logout, updateUser } = useAuth()
+  const { user, logout, updateUser, rolePath } = useAuth()
   const navigate = useNavigate()
   const [editing, setEditing] = useState(false)
   const [name, setName] = useState(user?.name ?? '')
@@ -1307,24 +2314,75 @@ function ProfilePage() {
   }
   return (
     <div className="profile-page">
-      <Link className="landing-brand" to="/manager/dashboard"><span className="brand-mark">P</span> propwise</Link>
+      <header className="profile-top-nav">
+        <Link className="landing-brand" to={rolePath(user.role)}>
+          <span className="brand-mark">P</span> propwise
+        </Link>
+        <Link className="profile-back-link" to={rolePath(user.role)}>
+          ← Back to Dashboard
+        </Link>
+      </header>
+
       <section className="profile-card">
-        <div className="profile-header"><div className="avatar profile-avatar">{user.name.slice(0, 2).toUpperCase()}</div><div><p className="eyebrow">YOUR PROFILE</p><h1>{user.name}</h1><span className="role-pill">{getRoleLabel(user.role)}</span></div></div>
+        <div className="profile-header">
+          <div className="avatar profile-avatar">{user.name.slice(0, 2).toUpperCase()}</div>
+          <div className="profile-header-info">
+            <p className="eyebrow">YOUR PROFILE</p>
+            <h1>{user.name}</h1>
+            <span className="role-pill">{getRoleLabel(user.role)}</span>
+          </div>
+        </div>
+
         {saved && <p className="profile-success" role="status">Profile updated successfully.</p>}
+
         {editing ? (
           <form className="profile-form" onSubmit={saveProfile}>
-            <label>Full name<input value={name} onChange={(event) => setName(event.target.value)} required /></label>
-            <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
-            <label>Phone number<input value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="Optional" /></label>
-            <label className="profile-check"><input type="checkbox" checked={emailUpdates} onChange={(event) => setEmailUpdates(event.target.checked)} /> Receive email updates</label>
-            <div className="profile-actions"><button className="secondary-button profile-cancel" type="button" onClick={() => setEditing(false)}>Cancel</button><button className="primary-button" type="submit">Save changes</button></div>
+            <label>
+              Full name
+              <input value={name} onChange={(event) => setName(event.target.value)} required />
+            </label>
+            <label>
+              Email address
+              <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required />
+            </label>
+            <label>
+              Phone number
+              <input value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="e.g. +91 98765 43210" />
+            </label>
+            <label className="profile-check">
+              <input type="checkbox" checked={emailUpdates} onChange={(event) => setEmailUpdates(event.target.checked)} />
+              Receive operational email updates
+            </label>
+            <div className="profile-actions">
+              <button className="secondary-button profile-cancel" type="button" onClick={() => setEditing(false)}>Cancel</button>
+              <button className="primary-button" type="submit">Save changes</button>
+            </div>
           </form>
         ) : (
           <>
-            <p className="profile-contact">{user.email}{user.phone && ` · ${user.phone}`}</p>
-            <hr />
-            <p><strong>Organization</strong><br />{user.organization}</p>
-            <div className="profile-actions"><button className="secondary-button profile-edit" type="button" onClick={() => setEditing(true)}>Edit profile</button><button className="primary-button" type="button" onClick={() => { logout(); navigate('/login') }}>Log out</button></div>
+            <div className="profile-details-grid">
+              <div className="profile-detail-card">
+                <span className="profile-detail-label">Email Address</span>
+                <span className="profile-detail-val">{user.email}</span>
+              </div>
+              <div className="profile-detail-card">
+                <span className="profile-detail-label">Phone Number</span>
+                <span className="profile-detail-val">{user.phone || 'Not provided'}</span>
+              </div>
+              <div className="profile-detail-card">
+                <span className="profile-detail-label">Organization</span>
+                <span className="profile-detail-val">{user.organization}</span>
+              </div>
+              <div className="profile-detail-card">
+                <span className="profile-detail-label">Assigned Role</span>
+                <span className="profile-detail-val">{getRoleLabel(user.role)}</span>
+              </div>
+            </div>
+
+            <div className="profile-actions">
+              <button className="secondary-button profile-edit" type="button" onClick={() => setEditing(true)}>Edit profile</button>
+              <button className="profile-logout-button" type="button" onClick={() => { logout(); navigate('/login') }}>Log out</button>
+            </div>
           </>
         )}
       </section>
@@ -1340,7 +2398,7 @@ function App() {
         <Routes>
           <Route path="/" element={<LandingPage />} />
           <Route path="/login" element={<LoginPage />} />
-            <Route path="/signup" element={<SignupPage />} />\n            <Route path="/signup" element={<SignupPage />} />
+          <Route path="/signup" element={<SignupPage />} />
           <Route path="/forgot-password" element={<RecoveryPage />} />
           <Route path="/reset-password" element={<RecoveryPage reset />} />
           <Route path="/unauthorized" element={<AccessDeniedPage />} />
@@ -1354,7 +2412,7 @@ function App() {
           <Route path="/staff/dashboard" element={<ProtectedRoute roles={['STAFF', 'SUPER_ADMIN', 'PROPERTY_MANAGER']}><StaffDashboardPage /></ProtectedRoute>} />
 
           {/* Admin section routes */}
-          <Route path="/admin/users" element={<ProtectedRoute roles={['SUPER_ADMIN', 'PROPERTY_MANAGER']}><RoutePlaceholder name="Users" /></ProtectedRoute>} />
+          <Route path="/admin/users" element={<ProtectedRoute roles={['SUPER_ADMIN', 'PROPERTY_MANAGER']}><StaffDirectoryPage /></ProtectedRoute>} />
           <Route path="/admin/audit" element={<ProtectedRoute roles={['SUPER_ADMIN', 'PROPERTY_MANAGER']}><RoutePlaceholder name="Audit Log" /></ProtectedRoute>} />
 
           {/* Tenant section routes */}

@@ -1,6 +1,8 @@
 /* oxlint-disable react/only-export-components */
 import { createContext, type ReactNode, useContext, useState } from 'react'
 
+const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:5000/api'
+
 export type Role = 'SUPER_ADMIN' | 'PROPERTY_MANAGER' | 'TENANT' | 'STAFF'
 
 export type User = {
@@ -9,6 +11,7 @@ export type User = {
   email: string
   role: Role
   organization: string
+  specialty?: string
   phone?: string
   preferences?: {
     emailUpdates: boolean
@@ -20,6 +23,22 @@ const users: Record<string, User> = {
   'admin@propwise.test':   { id: 'usr_admin',   name: 'Sam Rivera',   email: 'admin@propwise.test',   role: 'SUPER_ADMIN',       organization: 'Propwise Management' },
   'tenant@propwise.test':  { id: 'usr_tenant',  name: 'Maya Carter',  email: 'tenant@propwise.test',  role: 'TENANT',            organization: 'Propwise Management' },
   'staff@propwise.test':   { id: 'usr_staff',   name: 'Chris Lee',    email: 'staff@propwise.test',   role: 'STAFF',             organization: 'Propwise Management' },
+  'ravi.electrician@propwise.test': { id: 'usr_ravi_electrician', name: 'Ravi Kumar', email: 'ravi.electrician@propwise.test', role: 'STAFF', organization: 'Propwise Management', specialty: 'Electrician', phone: '+91 98765 43210' },
+  'anita.electrician@propwise.test': { id: 'usr_anita_electrician', name: 'Anita Das', email: 'anita.electrician@propwise.test', role: 'STAFF', organization: 'Propwise Management', specialty: 'Electrician', phone: '+91 98765 43211' },
+  'vikram.plumber@propwise.test': { id: 'usr_vikram_plumber', name: 'Vikram Singh', email: 'vikram.plumber@propwise.test', role: 'STAFF', organization: 'Propwise Management', specialty: 'Plumber', phone: '+91 98765 43212' },
+  'neha.plumber@propwise.test': { id: 'usr_neha_plumber', name: 'Neha Patel', email: 'neha.plumber@propwise.test', role: 'STAFF', organization: 'Propwise Management', specialty: 'Plumber', phone: '+91 98765 43213' },
+  'arjun.carpenter@propwise.test': { id: 'usr_arjun_carpenter', name: 'Arjun Mehta', email: 'arjun.carpenter@propwise.test', role: 'STAFF', organization: 'Propwise Management', specialty: 'Carpenter', phone: '+91 98765 43214' },
+  'kavya.carpenter@propwise.test': { id: 'usr_kavya_carpenter', name: 'Kavya Rao', email: 'kavya.carpenter@propwise.test', role: 'STAFF', organization: 'Propwise Management', specialty: 'Carpenter', phone: '+91 98765 43215' },
+  'alex.staff@propwise.test':   { id: 'usr_alex',   name: 'Alex Rivers',   email: 'alex.staff@propwise.test',   role: 'STAFF', organization: 'Propwise Management' },
+  'sarah.staff@propwise.test':  { id: 'usr_sarah',  name: 'Sarah Connor',  email: 'sarah.staff@propwise.test',  role: 'STAFF', organization: 'Propwise Management' },
+  'marcus.staff@propwise.test': { id: 'usr_marcus', name: 'Marcus Vance',  email: 'marcus.staff@propwise.test', role: 'STAFF', organization: 'Propwise Management' },
+  'elena.staff@propwise.test':  { id: 'usr_elena',  name: 'Elena Rostova', email: 'elena.staff@propwise.test', role: 'STAFF', organization: 'Propwise Management' },
+  'david.staff@propwise.test':  { id: 'usr_david',  name: 'David Miller',  email: 'david.staff@propwise.test', role: 'STAFF', organization: 'Propwise Management' },
+  'priya.staff@propwise.test':  { id: 'usr_priya',  name: 'Priya Sharma',  email: 'priya.staff@propwise.test', role: 'STAFF', organization: 'Propwise Management' },
+  'james.staff@propwise.test':  { id: 'usr_james',  name: 'James Wilson',  email: 'james.staff@propwise.test', role: 'STAFF', organization: 'Propwise Management' },
+  'carlos.staff@propwise.test': { id: 'usr_carlos', name: 'Carlos Mendez', email: 'carlos.staff@propwise.test', role: 'STAFF', organization: 'Propwise Management' },
+  'maya.staff@propwise.test':   { id: 'usr_maya',   name: 'Maya Patel',    email: 'maya.staff@propwise.test',   role: 'STAFF', organization: 'Propwise Management' },
+  'kevin.staff@propwise.test':  { id: 'usr_kevin',  name: 'Kevin Durant',  email: 'kevin.staff@propwise.test',  role: 'STAFF', organization: 'Propwise Management' },
 }
 
 const rolePaths: Record<Role, string> = {
@@ -49,7 +68,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = async (email: string, password: string) => {
     try {
-      const response = await fetch('https://propwise-backend.onrender.com/api/auth/login', {
+      const response = await fetch(`${API_BASE_URL}/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password })
@@ -79,10 +98,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signup = async (name: string, email: string, password: string, role: string) => {
     try {
-      const response = await fetch('https://propwise-backend.onrender.com/api/auth/signup', {
+      const response = await fetch(`${API_BASE_URL}/auth/signup`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, email, password, role })
+        body: JSON.stringify({ name, email, password, role: role.toLowerCase().replace('property_manager', 'manager') })
       })
       if (!response.ok) return { ok: false, error: 'Signup failed. Email may already exist.' }
       return login(email, password)
